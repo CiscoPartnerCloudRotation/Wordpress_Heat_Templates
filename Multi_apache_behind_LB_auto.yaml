@@ -1,0 +1,136 @@
+heat_template_version: 2013-05-23
+
+description: >
+  Heat WordPress template for Cisco Partner Cloud Rotation
+
+parameters:
+
+  key_name:
+    type: string
+    description: Name of a KeyPair to enable SSH access to the instance
+    default: wordpress
+    constraints:
+        - allowed_values: [Hunterks_KeyPair, wordpress]
+  instance_type:
+    type: string
+    description: Instance type for WordPress server
+    default: Small
+    constraints:
+        - allowed_values: [t2.nano, Small, Standard, Large]
+  image_id:
+    type: string
+    description: >
+     Using a CentOS 7 image for the wordpress deployment
+    default: CentOS 7 Cloud
+    constraints:
+        - allowed_values: [CentOS 7 Cloud, RancherOS]
+  Sec_Group:
+    type: string
+    description: Security Group to use for the Wordpress Server
+    default: WEB
+  public_net:
+    type: string
+    description: External Network
+    default: External
+  external_network_id:
+    type: string
+    description: UUID of a Neutron external network
+    default: c54b1dc1-d046-4fbb-8612-dfff17fcb1ac
+  num_instances:
+    type: string
+    description: Number of instances to create
+    default: 3
+  
+
+resources:
+  private_net:
+        type: OS::Neutron::Net
+        properties:
+          name: WEBservers
+
+  private_subnet:
+        type: OS::Neutron::Subnet
+        properties:
+          network_id: { get_resource: private_net }
+          cidr: 192.168.50.0/24
+          gateway_ip: 192.168.50.1
+          dns_nameservers: ["8.8.8.8"]
+  router1:
+        type: OS::Neutron::Router
+        properties:
+          external_gateway_info:
+            network: External
+
+  Web_Interface:
+        type: OS::Neutron::RouterInterface
+        properties:
+          router_id: { get_resource: router1 }
+          subnet_id: { get_resource: private_subnet }
+
+  web_nodes:
+        type: OS::Heat::ResourceGroup
+        properties:
+            count: {get_param: num_instances}
+            resource_def:
+              type: OS::Nova::Server
+              properties:
+                        image: { get_param: image_id }
+                        flavor: { get_param: instance_type }
+                        networks: 
+                          - network: { get_resource: private_net }
+                          - subnet: { get_resource: private_subnet }
+                        user_data: |
+                                #!/bin/bash -v
+
+                                yum -y install httpd
+                                systemctl enable httpd.service
+                                systemctl start httpd.service
+                                systemctl disable firewalld
+                                
+                                sed -i 's/SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
+                                cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1 > /var/www/html/index.html 
+                                reboot
+                                systemctl start httpd.service
+                                #parms:
+                          #servername: {get_attr: [web_nodes, refs]} 
+
+
+  monitor:
+        type: OS::Neutron::HealthMonitor
+        properties:
+          type: TCP
+          delay: 5
+          max_retries: 5
+          timeout: 5
+  pool:
+        type: OS::Neutron::Pool
+        properties:
+          protocol: HTTP
+          name: WebServer Pool
+          monitors: [ { get_resource: monitor } ]
+          subnet_id: { get_resource: private_subnet }  
+          lb_method: ROUND_ROBIN
+          vip:
+             protocol_port: 80
+          
+  lb:
+        type: OS::Neutron::LoadBalancer
+        properties:
+          protocol_port: 80
+          pool_id: { get_resource: pool}
+          members: { get_attr: [web_nodes, refs] }
+
+  # assign a floating ip address to the load balancer
+  # pool.
+  lb_floating:
+        type: OS::Neutron::FloatingIP
+        properties:
+          floating_network_id: c54b1dc1-d046-4fbb-8612-dfff17fcb1ac
+          port_id: {get_attr: [pool, vip, port_id]}
+outputs:
+  FloatingIP:
+    description: Service public VIP
+    value: { get_attr: [lb_floating, floating_ip_address] }
+  VIP:
+    description: Internal VIP
+    value: { get_attr: [pool, vip, address] }
